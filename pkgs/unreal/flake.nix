@@ -1,507 +1,565 @@
 {
-  description = "Unreal Engine 5 for NixOS";
+  description = "Unreal Engine 5 (dev environment + packaging experiments)";
 
-  inputs.nixpkgs.url = "nixpkgs/nixos-unstable";
+  # Pinned nixpkgs for reproducible devShells / wrappers.
+  # If GitHub access is unreliable, you can temporarily switch this to a local
+  # `path:/nix/store/.../nixos` snapshot (system channels) and re-lock.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
 
   outputs = { self, nixpkgs }:
     let
-      pkgs = import nixpkgs {
-        system = "x86_64-linux";
-        overlays = [ self.overlays.default ];
-        config.allowUnfree = true;
-      };
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
+      lib = pkgs.lib;
 
-      mkUnrealEngine = { pname, version, src ? "/home/vitalyr/projects/dev/cpp/UnrealEngine" }:
-        with pkgs;
-        stdenv.mkDerivation rec {
-          inherit pname version;
-          
-          # Use local source by default  
-          src = builtins.path { path = /home/vitalyr/projects/dev/cpp/UnrealEngine; name = "UnrealEngine-source"; };
+      # NOTE: UE's own Setup scripts install a bundled toolchain + dotnet runtime
+      # (see `Engine/Build/BatchFiles/Linux/Setup.sh` + `SetupToolchain.sh`).
+      # We intentionally avoid pulling heavyweight toolchains from nixpkgs here.
+      deps = with pkgs; [
+        openssl
+        zlib
+      ];
 
-          nativeBuildInputs = [
-            git
-            openssh
-            wget
-            curl
-            makeWrapper
-            patchelf
-            python3
-            dotnet-sdk_8
-            dotnet-runtime_8
-            clang_20
-            lld_20
-            llvmPackages_20.bintools  # This provides llvm-ar and other LLVM tools
-            cmake
-            ninja
-            pkg-config
-          ];
+      tools = with pkgs; [
+        bash
+        coreutils
+        findutils
+        gnugrep
+        gawk
+        gnused
+        which
+        git
+        curl
+        wget
+        gnutar
+        gzip
+        python3
+        cmake
+        ninja
+        gnumake
+        unzip
+        zip
+        rsync
+        perl
+        patchelf
+      ];
 
-          buildInputs = [
-            # Core dependencies
+      unrealFhs = pkgs.buildFHSEnv {
+        name = "ue5-fhs";
+
+        targetPkgs = pkgs:
+          tools
+          ++ deps
+          ++ (with pkgs; [
+            udev
+            alsa-lib
             icu
             SDL2
             vulkan-loader
-            vulkan-headers
-            xorg.libX11
-            xorg.libXi
-            xorg.libXxf86vm
-            xorg.libXfixes
-            xorg.libXrender
-            xorg.libXcursor
-            xorg.libXinerama
-            xorg.libXrandr
-            xorg.libICE
-            xorg.libSM
-            libGL
-            libGLU
-            openssl
-            zlib
-            libxml2
-            freetype
-            fontconfig
-            alsa-lib
-            pulseaudio
-            wayland
+            vulkan-tools
+            vulkan-validation-layers
+            glib
             libxkbcommon
+            nss
+            nspr
+            atk
+            mesa
             dbus
-            systemd
-            # Additional build dependencies
-            glibc
-            glibc.dev
-            gcc.cc.lib
-            gcc
-            stdenv.cc.cc
-            ncurses
-            readline
-            libuuid
-            xdg-user-dirs
-            # Steam run for compatibility
-            steam-run
-          ];
+            pango
+            cairo
+            libpulseaudio
+            libGL
+            libgbm
+            expat
+            libdrm
+            wayland
+          ])
+          ++ (with pkgs.xorg; [
+            libICE
+            libSM
+            libX11
+            libxcb
+            libXcomposite
+            libXcursor
+            libXdamage
+            libXext
+            libXfixes
+            libXi
+            libXrandr
+            libXrender
+            libXScrnSaver
+            libxshmfence
+            libXtst
+          ]);
 
-          # Disable sandbox for network access
-          __noChroot = true;
-          
-          # Environment variables
-          DOTNET_CLI_TELEMETRY_OPTOUT = "1";
-          DOTNET_SKIP_FIRST_TIME_EXPERIENCE = "1";
-          DOTNET_SYSTEM_NET_HTTP_USESOCKETSHTTPHANDLER = "0";
-          DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1";
-          
-          # Use clang as compiler
-          CC = "${clang_20}/bin/clang";
-          CXX = "${clang_20}/bin/clang++";
-          
-          # Set library paths
-          LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
-          
-          # Critical for NixOS: Set proper include and library paths for clang
-          NIX_CFLAGS_COMPILE = "-isystem ${glibc.dev}/include -isystem ${stdenv.cc.cc}/include/c++/v1";
-          NIX_LDFLAGS = "-L${glibc}/lib -L${stdenv.cc.cc.lib}/lib -L${gcc.cc.lib}/lib";
-          CPLUS_INCLUDE_PATH = "${stdenv.cc.cc}/include/c++/v1:${glibc.dev}/include";
-          C_INCLUDE_PATH = "${glibc.dev}/include";
+        runScript = "bash";
 
-          postPatch = ''
-            echo "Post-patching UnrealEngine scripts for NixOS..."
-            
-            # Use regular bash, not bash-interactive
-            BASH_BIN="${pkgs.bashInteractive}/bin/bash"
-            echo "Using bash: $BASH_BIN"
-            
-            # Force patch ALL shell scripts after patchShebangs
-            echo "Patching ALL shell scripts..."
-            find . -name "*.sh" -type f -exec sed -i "1s|#!/bin/bash|#!$BASH_BIN|" {} \;
-            find . -name "*.sh" -type f -exec sed -i "1s|#!/usr/bin/env bash|#!$BASH_BIN|" {} \;
-            find . -name "*.sh" -type f -exec sed -i "1s|#! /bin/bash|#!$BASH_BIN|" {} \;
-            find . -name "*.sh" -type f -exec sed -i "1s|#!/bin/sh|#!$BASH_BIN|" {} \;
-            find . -name "*.sh" -type f -exec chmod +x {} \;
-            
-            # Specifically patch critical scripts
-            for script in Setup.sh GenerateProjectFiles.sh; do
-                if [ -f "$script" ]; then
-                    sed -i "1s|.*|#!$BASH_BIN|" "$script"
-                    chmod +x "$script"
-                    echo "$script shebang: $(head -n1 $script)"
-                fi
-            done
-            
-            # Patch Engine/Build/BatchFiles scripts specifically
-            if [ -d "Engine/Build/BatchFiles" ]; then
-                echo "Patching Engine/Build/BatchFiles scripts..."
-                find Engine/Build/BatchFiles -name "*.sh" -type f -exec sed -i "1s|.*|#!$BASH_BIN|" {} \;
-                find Engine/Build/BatchFiles -name "*.sh" -type f -exec chmod +x {} \;
-                
-                # Check GitDependencies.sh specifically
-                if [ -f "Engine/Build/BatchFiles/Linux/GitDependencies.sh" ]; then
-                    echo "GitDependencies.sh shebang: $(head -n1 Engine/Build/BatchFiles/Linux/GitDependencies.sh)"
-                fi
-            fi
-            
-            # Patch ELF binaries for NixOS
-            echo "Patching ELF binaries..."
-            if [ -n "$NIX_CC" ] && [ -f "$NIX_CC/nix-support/dynamic-linker" ]; then
-                DYNAMIC_LINKER=$(cat $NIX_CC/nix-support/dynamic-linker)
-                echo "Using dynamic linker: $DYNAMIC_LINKER"
-                
-                # Patch GitDependencies binary specifically
-                GITDEPS_BINARY="Engine/Binaries/DotNET/GitDependencies/linux-x64/GitDependencies"
-                if [ -f "$GITDEPS_BINARY" ]; then
-                    echo "Patching GitDependencies binary: $GITDEPS_BINARY"
-                    ${pkgs.patchelf}/bin/patchelf --set-interpreter "$DYNAMIC_LINKER" "$GITDEPS_BINARY" || true
-                    
-                    # Also set rpath for required libraries
-                    RPATH_DIRS="${lib.makeLibraryPath buildInputs}"
-                    ${pkgs.patchelf}/bin/patchelf --set-rpath "$RPATH_DIRS" "$GITDEPS_BINARY" || true
-                    
-                    echo "GitDependencies binary patched"
-                fi
-                
-                # Patch other binaries if needed
-                find Engine/Binaries -name "*" -type f -executable | while read -r binary; do
-                    if file "$binary" 2>/dev/null | grep -q "ELF.*executable\|ELF.*shared object"; then
-                        echo "Patching binary: $binary"
-                        ${pkgs.patchelf}/bin/patchelf --set-interpreter "$DYNAMIC_LINKER" "$binary" 2>/dev/null || true
-                    fi
-                done
-            else
-                echo "Warning: Could not find dynamic linker, skipping ELF patching"
-            fi
-          '';
-
-          configurePhase = ''
-            runHook preConfigure
-            
-            # Set up build directory
-            mkdir -p $out
-            export UE_INSTALL_LOCATION=$out
-            
-            # Set additional environment variables for dotnet
-            export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-            export LD_LIBRARY_PATH="${lib.makeLibraryPath buildInputs}:$LD_LIBRARY_PATH"
-            # Use current XDG_RUNTIME_DIR if available, fallback to user runtime dir
-            export XDG_RUNTIME_DIR=''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-            
-            # Critical for NixOS: Set proper paths for clang to find headers and libraries
-            export CPLUS_INCLUDE_PATH="${stdenv.cc.cc}/include/c++/v1:${glibc.dev}/include"
-            export C_INCLUDE_PATH="${glibc.dev}/include"
-            export LIBRARY_PATH="${gcc.cc.lib}/lib:${glibc}/lib"
-            
-            # Ensure LLVM tools are in PATH
-            export PATH="${llvmPackages_20.bintools}/bin:$PATH"
-            
-            # Set UE-specific environment variables to bypass SDK checks
-            export UE_USE_SYSTEM_COMPILER=1
-            export LINUX_MULTIARCH_ROOT="${pkgs.glibc}/lib"
-            export UE_LINUX_USE_BUNDLED_LIBC=0
-            export UE_BUILD_DEVELOPER_TOOLS=1
-            export UE_BUILD_SHIPPING=0
-            
-            # Run Setup.sh with explicit bash to download dependencies
-            echo "Running Setup.sh with explicit bash..."
-            ${pkgs.bashInteractive}/bin/bash ./Setup.sh || true
-            
-            # Modify Linux SDK configuration to work with Nix environment
-            echo "Configuring Linux SDK for NixOS compatibility..."
-            if [ -f "Engine/Config/Linux/Linux_SDK.json" ]; then
-                # Backup original
-                cp "Engine/Config/Linux/Linux_SDK.json" "Engine/Config/Linux/Linux_SDK.json.bak"
-                # Create compatible SDK configuration
-                cat > "Engine/Config/Linux/Linux_SDK.json" << 'EOF'
-{
-	"MainVersion" : "nix-clang-18",
-	"MinVersion" : "nix-clang-18", 
-	"MaxVersion" : "nix-clang-18",
-
-	"AutoSDKPlatform" : "Linux_x64"
-}
-EOF
-                echo "Updated Linux SDK configuration for NixOS"
-            fi
-            
-            # Create fake AutoSDK structure to satisfy UE platform checks
-            echo "Creating AutoSDK structure for Linux platform..."
-            SDK_VERSION="nix-clang-18"
-            SDK_ROOT="Engine/Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64"
-            SDK_VERSION_DIR="$SDK_ROOT/$SDK_VERSION"
-            mkdir -p "$SDK_VERSION_DIR/x86_64-unknown-linux-gnu"
-            
-            # Create the required ToolchainVersion.txt file (this is critical for UE SDK detection)
-            echo "$SDK_VERSION" > "$SDK_VERSION_DIR/ToolchainVersion.txt"
-            
-            # Create a minimal SDK info file
-            cat > "$SDK_VERSION_DIR/Setup.sh" << 'EOF'
-#!/bin/bash
-# NixOS Linux SDK - using system toolchain
-echo "NixOS Linux SDK - using system toolchain"
-export UE_SDKS_ROOT="$(dirname "$(dirname "$(dirname "$(dirname "$(realpath "''${BASH_SOURCE[0]}")")")")")"
-export LINUX_SDK_ROOT="''${UE_SDKS_ROOT}/HostLinux/Linux_x64"
-EOF
-            chmod +x "$SDK_VERSION_DIR/Setup.sh"
-            
-            # Also create a VERSION file for compatibility
-            echo "$SDK_VERSION" > "$SDK_VERSION_DIR/VERSION"
-            
-            # Set AutoSDK environment variables
-            export UE_SDKS_ROOT="$PWD/Engine/Extras/ThirdPartyNotUE/SDKs"
-            export LINUX_SDK_ROOT="$UE_SDKS_ROOT/HostLinux/Linux_x64"
-            # Critical: Set LINUX_MULTIARCH_ROOT to the versioned SDK directory
-            export LINUX_MULTIARCH_ROOT="$PWD/$SDK_VERSION_DIR"
-            
-            # Configure NuGet environment with proper permissions
-            echo "Configuring NuGet environment..."
-            export HOME=$PWD/.nuget-home
-            export DOTNET_CLI_HOME=$HOME
-            export NUGET_HTTP_CACHE_PATH=$HOME/.nuget-cache
-            export NUGET_PACKAGES=$HOME/.nuget-packages
-            
-            # Create directories with proper permissions
-            mkdir -p $HOME/.nuget
-            mkdir -p $NUGET_HTTP_CACHE_PATH
-            mkdir -p $NUGET_PACKAGES
-            chmod -R 755 $HOME
-            
-            # Create a basic NuGet.Config file
-            cat > $HOME/.nuget/NuGet.Config << 'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <packageSources>
-    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
-  </packageSources>
-</configuration>
-EOF
-            chmod 644 $HOME/.nuget/NuGet.Config
-            
-            # Test network connectivity
-            echo "Testing network connectivity..."
-            ${pkgs.curl}/bin/curl -I https://api.nuget.org/v3/index.json || echo "Network test failed"
-            
-            # Restore NuGet packages for UnrealBuildTool with proper environment
-            echo "Restoring NuGet packages for UnrealBuildTool..."
-            if [ -f "Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj" ]; then
-                ${pkgs.dotnet-sdk_8}/bin/dotnet restore Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj --configfile $HOME/.nuget/NuGet.Config || true
-            fi
-            
-            # Create .lldbinit in a writable location to avoid the read-only filesystem error
-            mkdir -p /tmp/lldb-init
-            export HOME_BACKUP=$HOME
-            export HOME=/tmp/lldb-init
-            
-            # Ensure LLVM tools are in PATH and create symlinks
-            export PATH="${llvmPackages_20.bintools}/bin:$PATH"
-            echo "Checking for llvm-ar: $(which llvm-ar || echo 'not found')"
-            
-            # Create symlinks in Engine/Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64/x86_64-unknown-linux-gnu/bin/
-            # This is where UnrealBuildTool expects to find the tools when using the SDK
-            TOOLCHAIN_BIN_DIR="$PWD/Engine/Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64/$SDK_VERSION/x86_64-unknown-linux-gnu/bin"
-            mkdir -p "$TOOLCHAIN_BIN_DIR"
-            
-            # Create symlinks for all necessary LLVM tools
-            ln -sf ${llvmPackages_20.bintools}/bin/llvm-ar "$TOOLCHAIN_BIN_DIR/llvm-ar"
-            ln -sf ${llvmPackages_20.bintools}/bin/llvm-ranlib "$TOOLCHAIN_BIN_DIR/llvm-ranlib"
-            ln -sf ${llvmPackages_20.bintools}/bin/llvm-objcopy "$TOOLCHAIN_BIN_DIR/llvm-objcopy"
-            ln -sf ${llvmPackages_20.bintools}/bin/llvm-strip "$TOOLCHAIN_BIN_DIR/llvm-strip"
-            ln -sf ${clang_20}/bin/clang "$TOOLCHAIN_BIN_DIR/clang"
-            ln -sf ${clang_20}/bin/clang++ "$TOOLCHAIN_BIN_DIR/clang++"
-            ln -sf ${lld_20}/bin/lld "$TOOLCHAIN_BIN_DIR/lld"
-            ln -sf ${lld_20}/bin/ld.lld "$TOOLCHAIN_BIN_DIR/ld.lld"
-            
-            # Also create symlinks without the x86_64 directory for compatibility
-            TOOLCHAIN_BIN_DIR2="$PWD/Engine/Extras/ThirdPartyNotUE/SDKs/HostLinux/Linux_x64/$SDK_VERSION/bin"
-            mkdir -p "$TOOLCHAIN_BIN_DIR2"
-            ln -sf ${llvmPackages_20.bintools}/bin/llvm-ar "$TOOLCHAIN_BIN_DIR2/llvm-ar"
-            ln -sf ${clang_20}/bin/clang "$TOOLCHAIN_BIN_DIR2/clang"
-            ln -sf ${clang_20}/bin/clang++ "$TOOLCHAIN_BIN_DIR2/clang++"
-            
-            # Add toolchain bin directories to PATH
-            export PATH="$TOOLCHAIN_BIN_DIR:$TOOLCHAIN_BIN_DIR2:$PATH"
-            
-            # Generate project files - try without steam-run first since we need our PATH
-            echo "Running GenerateProjectFiles.sh..."
-            export HOME=$HOME_BACKUP
-            # Force enable Linux platform by setting additional environment variables
-            export UE_SKIP_TOOLCHAIN_CHECKS=1
-            export UE_OVERRIDE_PLATFORM_SDK=1
-            if ${pkgs.bashInteractive}/bin/bash ./GenerateProjectFiles.sh -makefile -platforms=Linux -ForceUseSystemCompiler; then
-                echo "GenerateProjectFiles.sh completed successfully"
-            else
-                echo "GenerateProjectFiles.sh failed, trying with steam-run..."
-                export HOME=/tmp/lldb-init
-                if PATH="${llvmPackages_20.bintools}/bin:$PATH" ${pkgs.steam-run}/bin/steam-run ${pkgs.bashInteractive}/bin/bash ./GenerateProjectFiles.sh -makefile -ForceUseSystemCompiler; then
-                    echo "GenerateProjectFiles.sh completed successfully without steam-run"
-                else
-                    echo "Both attempts to run GenerateProjectFiles.sh failed"
-                    # List what files were created to debug
-                    echo "Files in current directory:"
-                    ls -la
-                    echo "Checking for Makefile or .mk files:"
-                    find . -name "Makefile*" -o -name "*.mk" | head -10
-                fi
-            fi
-            
-            # Restore HOME
-            export HOME=$HOME_BACKUP
-            
-            runHook postConfigure
-          '';
-
-          buildPhase = ''
-            runHook preBuild
-            
-            # Check if Makefile exists
-            if [ -f Makefile ]; then
-                echo "Found Makefile, building UnrealEditor..."
-                # Build sequentially to avoid UnrealBuildTool mutex conflicts
-                # Use ARGS to pass -ForceUseSystemCompiler to UnrealBuildTool
-                make UnrealEditor ARGS=-ForceUseSystemCompiler || echo "UnrealEditor build failed"
-                make ShaderCompileWorker ARGS=-ForceUseSystemCompiler || echo "ShaderCompileWorker build failed"  
-                make UnrealLightmass ARGS=-ForceUseSystemCompiler || echo "UnrealLightmass build failed"
-                make UnrealPak ARGS=-ForceUseSystemCompiler || echo "UnrealPak build failed"
-            else
-                echo "No Makefile found, checking for alternative build systems..."
-                if [ -f "Engine/Build/BatchFiles/Linux/Build.sh" ]; then
-                    echo "Using Engine build script..."
-                    cd Engine/Build/BatchFiles/Linux
-                    ${pkgs.bashInteractive}/bin/bash ./Build.sh UnrealEditor Linux Development || true
-                    cd ../../../..
-                elif [ -d "Engine/Binaries/Linux" ] && [ -f "Engine/Binaries/Linux/UnrealEditor" ]; then
-                    echo "UnrealEditor binary already exists, skipping build"
-                else
-                    echo "No build system found, listing directory contents for debugging..."
-                    ls -la
-                    echo "Checking Engine directory..."
-                    ls -la Engine/ | head -10
-                    exit 1
-                fi
-            fi
-            
-            runHook postBuild
-          '';
-
-          installPhase = ''
-            runHook preInstall
-            
-            # Create installation directories
-            mkdir -p $out/bin
-            mkdir -p $out/lib
-            mkdir -p $out/share/unreal-engine
-            
-            # Copy engine files
-            cp -r Engine $out/share/unreal-engine/
-            
-            # Copy additional files if they exist
-            [ -f GenerateProjectFiles.sh ] && cp GenerateProjectFiles.sh $out/share/unreal-engine/
-            [ -f Setup.sh ] && cp Setup.sh $out/share/unreal-engine/
-            
-            # Create wrapper script for UnrealEditor if it exists
-            if [ -f "$out/share/unreal-engine/Engine/Binaries/Linux/UnrealEditor" ]; then
-                makeWrapper $out/share/unreal-engine/Engine/Binaries/Linux/UnrealEditor $out/bin/UnrealEditor \
-                  --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath buildInputs}" \
-                  --set UNREAL_ENGINE_ROOT $out/share/unreal-engine
-            else
-                echo "Warning: UnrealEditor binary not found, skipping wrapper creation"
-                # Create a placeholder script
-                cat > $out/bin/UnrealEditor << 'EOF'
-#!/bin/sh
-echo "UnrealEditor was not successfully built"
-echo "Please check the build logs for errors"
-exit 1
-EOF
-                chmod +x $out/bin/UnrealEditor
-            fi
-            
-            # Create symlinks
-            ln -s $out/bin/UnrealEditor $out/bin/UE5
-            ln -s $out/bin/UnrealEditor $out/bin/ue5
-            
-            runHook postInstall
-          '';
-
-          meta = with lib; {
-            description = "A 3D game engine by Epic Games";
-            homepage = "https://www.unrealengine.com/";
-            license = licenses.unfree;
-            platforms = platforms.linux;
-            maintainers = [];
-            mainProgram = "UnrealEditor";
-          };
-        };
-
-    in {
-      overlays.default = final: prev: {
-        unreal_engine_5_5 = mkUnrealEngine {
-          pname = "unreal-engine";
-          version = "5.5.0";
-        };
-        
-        unreal_engine_5_6 = mkUnrealEngine {
-          pname = "unreal-engine";
-          version = "5.6.0";
-        };
+        # For non-FHS processes that rely on nix-ld.
+        NIX_LD_LIBRARY_PATH = lib.makeLibraryPath deps;
+        NIX_LD = "${pkgs.stdenv.cc.libc_bin}/bin/ld.so";
+        nativeBuildInputs = deps;
       };
 
-      packages.x86_64-linux = rec {
-        unreal_engine_5_5 = pkgs.unreal_engine_5_5;
-        unreal_engine_5_6 = pkgs.unreal_engine_5_6;
-        default = unreal_engine_5_6;
-      };
+      # NOTE: If you run flake commands from inside a git checkout, Nix defaults
+      # to `git+file://...` and excludes untracked files from the flake source.
+      # Since this repo often has new/untracked files under `pkgs/unreal/`,
+      # we provide a clearer error than "path ... does not exist".
+      requiredFiles = [
+        ./package.nix
+        ./com.unrealengine.UE5Editor.desktop
+        ./ue5editor.svg
+      ];
 
-      devShells.x86_64-linux.default = pkgs.mkShell {
-        buildInputs = with pkgs; [
-          # Development tools
-          git
-          gnumake
-          cmake
-          ninja
-          clang_20
-          lld_20
-          python3
-          dotnet-sdk_8
-          
-          # Libraries
-          icu
-          SDL2
-          vulkan-loader
-          vulkan-headers
-          xorg.libX11
-          xorg.libXi
-          libGL
-          openssl
-          zlib
-          
-          # Tools for debugging
-          gdb
-          valgrind
-          strace
-          patchelf
-        ];
+      missingFiles = builtins.filter (p: !(builtins.pathExists p)) requiredFiles;
+      missingFilesList =
+        builtins.concatStringsSep "\n  - " (map (p: toString p) missingFiles);
 
-        shellHook = ''
-          echo "Unreal Engine 5 development environment"
-          echo "----------------------------------------"
-          echo "Source directory: /home/vitalyr/projects/dev/cpp/UnrealEngine"
-          echo ""
-          echo "To build Unreal Engine:"
-          echo "  cd /home/vitalyr/projects/dev/cpp/UnrealEngine"
-          echo "  ./Setup.sh"
-          echo "  ./GenerateProjectFiles.sh"
-          echo "  make UnrealEditor"
-          echo ""
-          echo "Or use nix build:"
-          echo "  nix build .#unreal_engine_5_6"
-          
-          export CC=${pkgs.clang_20}/bin/clang
-          export CXX=${pkgs.clang_20}/bin/clang++
-          export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
-            pkgs.icu
-            pkgs.SDL2
-            pkgs.vulkan-loader
-            pkgs.xorg.libX11
-            pkgs.libGL
-            pkgs.openssl
-            pkgs.zlib
-          ]}:$LD_LIBRARY_PATH
+      ensureRequiredFiles =
+        if missingFiles == [] then
+          null
+        else
+          throw ''
+            Unreal flake: required files are missing from the flake source:
+              - ${missingFilesList}
+
+            This usually happens when using an implicit `git+file://` flake URL,
+            which excludes untracked files from the source.
+
+            Fix:
+              - Use a `path:` flake reference (includes untracked files):
+                  cd pkgs/unreal && nix flake show path:.
+                  cd pkgs/unreal && nix run path:.#unreal-fhs
+              - Or commit / `git add` the missing files.
+          '';
+
+      unrealEngine =
+        builtins.seq ensureRequiredFiles (import ./package.nix { inherit pkgs unrealFhs; });
+      unrealEngineInstalled =
+        builtins.seq ensureRequiredFiles (import ./package.nix {
+          inherit pkgs unrealFhs;
+          buildInstalled = true;
+        });
+
+      unrealBuildInstalled = pkgs.writeShellScriptBin "unreal-build-installed" ''
+          set -euo pipefail
+
+          usage() {
+            cat <<'EOF'
+          Usage:
+            unreal-build-installed [--with-ddc=(true|false)] [--built-dir=PATH]
+
+          Environment:
+            UE_SRC           Path to the UE source tree (default: ~/projects/dev/cpp/UnrealEngine)
+            UE_BUILTDIR      BuildGraph "BuiltDirectory" (default: $HOME/.cache/unreal-engine/LocalBuilds/Engine)
+
+          Notes:
+            - Runs inside the flake-provided FHS environment (fixes /bin/bash shebangs on NixOS).
+            - Mirrors AUR PKGBUILD BuildGraph invocation ("Make Installed Build Linux").
+            - We force `WithLinuxArm64=false` to avoid spending hours building AArch64 artifacts on x86_64 hosts.
+            - The BuildGraph XML does not accept a "SavedOutput" override; expect writes under "$UE_SRC/Engine/Saved".
+          EOF
+          }
+
+          if [[ "''${1:-}" == "--help" || "''${1:-}" == "-h" ]]; then
+            usage
+            exit 0
+          fi
+
+          with_ddc="false"
+          for arg in "$@"; do
+            case "$arg" in
+              --with-ddc=*)
+                with_ddc="''${arg#--with-ddc=}"
+                ;;
+              --built-dir=*)
+                export UE_BUILTDIR="''${arg#--built-dir=}"
+                ;;
+              *)
+                echo "Unknown argument: $arg" >&2
+                usage >&2
+                exit 2
+                ;;
+            esac
+          done
+
+          export UE_SRC="''${UE_SRC:-/home/vitalyr/projects/dev/cpp/UnrealEngine}"
+          export UE_BUILTDIR="''${UE_BUILTDIR:-$HOME/.cache/unreal-engine/LocalBuilds/Engine}"
+          export WITH_DDC="$with_ddc"
+
+          case "$with_ddc" in
+            true|false) ;;
+            *)
+              echo "Invalid --with-ddc value: $with_ddc (expected true/false)" >&2
+              exit 2
+              ;;
+          esac
+
+          mkdir -p "$UE_BUILTDIR"
+
+          export DOTNET_SYSTEM_NET_HTTP_USESOCKETSHTTPHANDLER=0
+
+          echo "UE_SRC=$UE_SRC"
+          echo "UE_BUILTDIR=$UE_BUILTDIR"
+          echo "WithDDC=$WITH_DDC"
+
+          exec ${unrealFhs}/bin/ue5-fhs -lc '
+            set -euo pipefail
+            ulimit -n 16000 || true
+            cd "$UE_SRC"
+
+            if [[ ! -x ./Engine/Build/BatchFiles/RunUAT.sh ]]; then
+              echo "ERROR: RunUAT.sh not found under UE_SRC=$UE_SRC" >&2
+              exit 1
+            fi
+
+            cmd=(
+              ./Engine/Build/BatchFiles/RunUAT.sh
+              BuildGraph
+              -target="Make Installed Build Linux"
+              -script=Engine/Build/InstalledEngineBuild.xml
+              -set:BuiltDirectory="$UE_BUILTDIR"
+              -set:WithDDC="$WITH_DDC"
+              -set:HostPlatformOnly=false
+              -set:WithLinux=true
+              -set:WithLinuxArm64=false
+              -set:WithWin64=true
+              -set:WithMac=false
+              -set:WithAndroid=false
+              -set:WithIOS=false
+              -set:WithTVOS=false
+            )
+
+            printf "Running: %q " "''${cmd[@]}"
+            echo
+            "''${cmd[@]}"
+          '
         '';
+
+      unrealPackageInstalled = pkgs.writeShellScriptBin "unreal-package-installed" ''
+        set -euo pipefail
+
+        usage() {
+          cat <<'EOF'
+        Usage:
+          unreal-package-installed [--out-link=NAME|--out-link NAME] [--installed-dir=PATH|--installed-dir PATH]
+
+        Purpose:
+          - Adds a BuildGraph "installed build" directory to the Nix store (once),
+            then builds the flake's `unreal-engine-installed` wrapper package.
+
+        Options:
+          --out-link=NAME       Name/path for the build result symlink (default: result-installed)
+          --installed-dir=PATH  Installed-build tree dir (default: $UE_INSTALLED_DIR or $UE_BUILTDIR/Linux)
+
+        Environment:
+          UE_INSTALLED_STORE_PATH  If set to an existing /nix/store/...-UnrealEngine-installed-linux,
+                                   skips the import step and reuses it.
+          UE_BUILTDIR              BuildGraph "BuiltDirectory" (default: $HOME/.cache/unreal-engine/LocalBuilds/Engine)
+          UE_INSTALLED_DIR         Installed-build tree dir (default: $UE_BUILTDIR/Linux)
+          XDG_CACHE_HOME           Used for caching UE_INSTALLED_STORE_PATH (fallback: $HOME/.cache)
+
+        Notes:
+          - Importing a full installed build can take a long time and add tens of GB to /nix/store.
+          - We cache the last successful UE_INSTALLED_STORE_PATH in:
+              $XDG_CACHE_HOME/unreal-engine/UE_INSTALLED_STORE_PATH
+          - Build the installed build first via:
+              UE_SRC=~/projects/dev/cpp/UnrealEngine nix run path:.#unreal-build-installed -- --with-ddc=false
+        EOF
+        }
+
+        if [[ "''${1:-}" == "--help" || "''${1:-}" == "-h" ]]; then
+          usage
+          exit 0
+        fi
+
+        out_link="result-installed"
+        installed_dir=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --out-link=*)
+              out_link="''${1#--out-link=}"
+              shift
+              ;;
+            --out-link)
+              if [[ -z "''${2:-}" ]]; then
+                echo "ERROR: --out-link requires a value" >&2
+                exit 2
+              fi
+              out_link="$2"
+              shift 2
+              ;;
+            --installed-dir=*)
+              installed_dir="''${1#--installed-dir=}"
+              shift
+              ;;
+            --installed-dir)
+              if [[ -z "''${2:-}" ]]; then
+                echo "ERROR: --installed-dir requires a value" >&2
+                exit 2
+              fi
+              installed_dir="$2"
+              shift 2
+              ;;
+            *)
+              echo "Unknown argument: $1" >&2
+              usage >&2
+              exit 2
+              ;;
+          esac
+        done
+
+        if [[ -z "$installed_dir" ]]; then
+          UE_BUILTDIR="''${UE_BUILTDIR:-$HOME/.cache/unreal-engine/LocalBuilds/Engine}"
+          installed_dir="''${UE_INSTALLED_DIR:-$UE_BUILTDIR/Linux}"
+        fi
+
+        # Avoid broken mirrors by default (user can override by setting NIX_CONFIG).
+        if [[ -z "''${NIX_CONFIG:-}" ]]; then
+          export NIX_CONFIG=$'substituters = https://cache.nixos.org\ntrusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=\n'
+        fi
+
+        flake_ref=${lib.escapeShellArg self.outPath}
+
+        cache_home="''${XDG_CACHE_HOME:-$HOME/.cache}"
+        cache_dir="$cache_home/unreal-engine"
+        cache_file="$cache_dir/UE_INSTALLED_STORE_PATH"
+
+        if [[ -z "''${UE_INSTALLED_STORE_PATH:-}" && -f "$cache_file" ]]; then
+          cached="$(head -n 1 "$cache_file" || true)"
+          if [[ -n "$cached" && -e "$cached" ]]; then
+            export UE_INSTALLED_STORE_PATH="$cached"
+          fi
+        fi
+
+        if [[ -n "''${UE_INSTALLED_STORE_PATH:-}" ]]; then
+          case "$UE_INSTALLED_STORE_PATH" in
+            /nix/store/*) ;;
+            *)
+              echo "ERROR: UE_INSTALLED_STORE_PATH must be a /nix/store path: $UE_INSTALLED_STORE_PATH" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! -e "$UE_INSTALLED_STORE_PATH" ]]; then
+            echo "ERROR: UE_INSTALLED_STORE_PATH does not exist: $UE_INSTALLED_STORE_PATH" >&2
+            exit 1
+          fi
+          store_path="$UE_INSTALLED_STORE_PATH"
+          echo "Reusing UE_INSTALLED_STORE_PATH=$store_path" >&2
+        else
+          if [[ ! -x "$installed_dir/Engine/Binaries/Linux/UnrealEditor" ]]; then
+            echo "ERROR: installed-build tree not found: $installed_dir" >&2
+            echo "Expected: $installed_dir/Engine/Binaries/Linux/UnrealEditor" >&2
+            exit 1
+          fi
+          echo "Adding installed build to the Nix store (this can take a while): $installed_dir" >&2
+          store_path="$(nix store add-path --name UnrealEngine-installed-linux "$installed_dir")"
+          echo "Added store path: $store_path" >&2
+        fi
+
+        mkdir -p "$cache_dir"
+        printf '%s\n' "$store_path" > "$cache_file"
+        echo "Cached UE_INSTALLED_STORE_PATH in: $cache_file" >&2
+
+        echo "Building flake package: $flake_ref#unreal-engine-installed" >&2
+        exec env UE_INSTALLED_STORE_PATH="$store_path" nix build "$flake_ref#unreal-engine-installed" --impure -L --out-link "$out_link"
+      '';
+
+      unrealSetup = pkgs.writeShellScriptBin "unreal-setup" ''
+        set -euo pipefail
+
+        export UE_SRC="''${UE_SRC:-/home/vitalyr/projects/dev/cpp/UnrealEngine}"
+
+        if [[ "''${1:-}" == "--help" || "''${1:-}" == "-h" ]]; then
+          cat <<'EOF'
+        Usage:
+          UE_SRC=/abs/path/to/UnrealEngine nix run path:.#unreal-setup -- [Setup.sh args...]
+
+        Notes:
+          - Runs `Setup.sh` inside the flake's FHS environment (fixes `/bin/bash` shebangs on NixOS).
+          - By default, this wrapper avoids overwriting `.git/hooks/*` (sets `GIT_DIR=/dev/null`).
+            Set `UE_SETUP_ALLOW_GIT_HOOKS=1` to let `Setup.sh` register hooks.
+
+        Examples:
+          UE_SRC=~/projects/dev/cpp/UnrealEngine nix run path:.#unreal-setup -- --force
+          UE_GITDEPS_ARGS="--exclude=Win64 --exclude=Mac" UE_SRC=~/projects/dev/cpp/UnrealEngine nix run path:.#unreal-setup -- --force
+        EOF
+          exit 0
+        fi
+
+        # Matches the AUR wrapper workaround; harmless for other operations.
+        export DOTNET_SYSTEM_NET_HTTP_USESOCKETSHTTPHANDLER=0
+
+        exec ${unrealFhs}/bin/ue5-fhs -lc '
+          set -euo pipefail
+          ulimit -n 16000 || true
+          UE_SRC="$1"; shift
+
+          # Avoid overwriting `.git/hooks/*` by default. Opt-in via:
+          #   UE_SETUP_ALLOW_GIT_HOOKS=1
+          if [[ "''${UE_SETUP_ALLOW_GIT_HOOKS:-0}" != "1" ]]; then
+            export GIT_DIR=/dev/null
+          fi
+
+          cd "$UE_SRC"
+          exec ./Setup.sh "$@"
+        ' bash "$UE_SRC" "$@"
+      '';
+
+      unrealGenerateProjectFiles = pkgs.writeShellScriptBin "unreal-generate-project-files" ''
+        set -euo pipefail
+
+        export UE_SRC="''${UE_SRC:-/home/vitalyr/projects/dev/cpp/UnrealEngine}"
+
+        if [[ "''${1:-}" == "--help" || "''${1:-}" == "-h" ]]; then
+          cat <<'EOF'
+        Usage:
+          UE_SRC=/abs/path/to/UnrealEngine nix run path:.#unreal-generate-project-files -- [GenerateProjectFiles.sh args...]
+
+        Notes:
+          - Runs `GenerateProjectFiles.sh` inside the flake's FHS environment (fixes `/bin/bash` shebangs on NixOS).
+        EOF
+          exit 0
+        fi
+
+        exec ${unrealFhs}/bin/ue5-fhs -lc '
+          set -euo pipefail
+          ulimit -n 16000 || true
+          UE_SRC="$1"; shift
+          cd "$UE_SRC"
+          exec ./GenerateProjectFiles.sh "$@"
+        ' bash "$UE_SRC" "$@"
+      '';
+
+      unrealBuild = pkgs.writeShellScriptBin "unreal-build" ''
+        set -euo pipefail
+
+        export UE_SRC="''${UE_SRC:-/home/vitalyr/projects/dev/cpp/UnrealEngine}"
+
+        if [[ "''${1:-}" == "--help" || "''${1:-}" == "-h" || $# -eq 0 ]]; then
+          cat <<'EOF'
+        Usage:
+          UE_SRC=/abs/path/to/UnrealEngine nix run path:.#unreal-build -- <Target> <Platform> <Configuration> [Build.sh args...]
+
+        Examples:
+          UE_SRC=~/projects/dev/cpp/UnrealEngine nix run path:.#unreal-build -- UnrealEditor Linux Development -Progress
+          UE_SRC=~/projects/dev/cpp/UnrealEngine nix run path:.#unreal-build -- ShaderCompileWorker Linux Development -Progress
+        EOF
+          exit 0
+        fi
+
+        exec ${unrealFhs}/bin/ue5-fhs -lc '
+          set -euo pipefail
+          ulimit -n 16000 || true
+          UE_SRC="$1"; shift
+          cd "$UE_SRC"
+          exec ./Engine/Build/BatchFiles/Linux/Build.sh "$@"
+        ' bash "$UE_SRC" "$@"
+      '';
+
+      unrealEditorInstalledDir = pkgs.writeShellScriptBin "unreal-editor-installed-dir" ''
+        set -euo pipefail
+
+        if [[ "$(id -u)" -eq 0 ]]; then
+          echo "ERROR: Run this as an unprivileged user; not as root." >&2
+          exit 1
+        fi
+
+        if [[ "''${1:-}" == "--help" || "''${1:-}" == "-h" ]]; then
+          cat <<'EOF'
+        Usage:
+          UE_INSTALLED_DIR=/abs/path/to/LocalBuilds/Engine/Linux nix run path:.#unreal-editor-installed-dir -- [UnrealEditor args...]
+
+        Environment:
+          UE_INSTALLED_DIR   Installed-build tree dir (default: $UE_BUILTDIR/Linux)
+          UE_BUILTDIR        BuildGraph "BuiltDirectory" (default: $HOME/.cache/unreal-engine/LocalBuilds/Engine)
+
+        Notes:
+          - Runs the installed build directly (no Nix store packaging/import).
+          - Uses the flake FHS environment to satisfy `/bin/bash` shebangs + runtime libs.
+        EOF
+          exit 0
+        fi
+
+        UE_BUILTDIR="''${UE_BUILTDIR:-$HOME/.cache/unreal-engine/LocalBuilds/Engine}"
+        UE_ROOT="''${UE_INSTALLED_DIR:-$UE_BUILTDIR/Linux}"
+
+        if [[ ! -x "$UE_ROOT/Engine/Binaries/Linux/UnrealEditor" ]]; then
+          echo "ERROR: UnrealEditor not found under UE_INSTALLED_DIR=$UE_ROOT" >&2
+          echo "Expected: $UE_ROOT/Engine/Binaries/Linux/UnrealEditor" >&2
+          exit 1
+        fi
+
+        exec ${unrealFhs}/bin/ue5-fhs -lc '
+          set -euo pipefail
+          ulimit -n 16000 || true
+          UE_ROOT="$1"; shift
+          cd "$UE_ROOT"
+          exec "$UE_ROOT/Engine/Binaries/Linux/UnrealEditor" "$@"
+        ' bash "$UE_ROOT" "$@"
+      '';
+    in
+    {
+      devShells.${system} = {
+        default = unrealFhs.env;
+      };
+
+      packages.${system} = {
+        unreal-fhs = unrealFhs;
+        unreal-package-installed = unrealPackageInstalled;
+        unreal-setup = unrealSetup;
+        unreal-generate-project-files = unrealGenerateProjectFiles;
+        unreal-build = unrealBuild;
+        unreal-editor-installed-dir = unrealEditorInstalledDir;
+        unreal-engine = unrealEngine;
+        unreal-engine-installed = unrealEngineInstalled;
+        default = unrealEngine;
+      };
+
+      apps.${system} = {
+        unreal-fhs = {
+          type = "app";
+          program = "${unrealFhs}/bin/ue5-fhs";
+        };
+
+        unreal-build-installed = {
+          type = "app";
+          program = "${unrealBuildInstalled}/bin/unreal-build-installed";
+        };
+
+        unreal-package-installed = {
+          type = "app";
+          program = "${unrealPackageInstalled}/bin/unreal-package-installed";
+        };
+
+        unreal-setup = {
+          type = "app";
+          program = "${unrealSetup}/bin/unreal-setup";
+        };
+
+        unreal-generate-project-files = {
+          type = "app";
+          program = "${unrealGenerateProjectFiles}/bin/unreal-generate-project-files";
+        };
+
+        unreal-build = {
+          type = "app";
+          program = "${unrealBuild}/bin/unreal-build";
+        };
+
+        unreal-editor-installed-dir = {
+          type = "app";
+          program = "${unrealEditorInstalledDir}/bin/unreal-editor-installed-dir";
+        };
+
+        unreal-editor = {
+          type = "app";
+          program = "${unrealEngine}/bin/UnrealEditor";
+        };
+
+        unreal-editor-installed = {
+          type = "app";
+          program = "${unrealEngineInstalled}/bin/UnrealEditor";
+        };
       };
     };
 }
