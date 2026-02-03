@@ -4,3 +4,12 @@ result-*
 
 # direnv state
 .direnv/
+
+# Local planning files (planning-with-files / Manus-style)
+# Keep these untracked (they may contain machine-specific notes).
+/task_plan.md
+/findings.md
+/progress.md
+/pkgs/unreal/plan.md
+/pkgs/unreal/findings.md
+/pkgs/unreal/progress.md
