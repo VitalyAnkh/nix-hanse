@@ -44,13 +44,144 @@
       # Development environment output
       devShells = forAllSystems (
         { pkgs }:
+        let
+          cudaNvcc = pkgs.cudaPackages.cuda_nvcc;
+          cudaCudart = pkgs.cudaPackages.cuda_cudart;
+        in
         {
+          # Minimal CUDA + C++ environment (fast to enter; good default).
+          #
+          # Goal: `nix develop` then `nvcc` can compile and the produced binary can run.
+          #
+          # Note: CUDA 12.x NVCC may reject very new GCC versions as the *host* compiler.
+          # We keep a supported GCC 14 for NVCC while still exposing the latest GCC for
+          # normal (non-CUDA) C/C++ builds.
           default = pkgs.mkShell {
+            packages = with pkgs; [
+              gcc # "latest" GCC for user builds
+              binutils
+              cmake
+              ninja
+              pkg-config
+              cudaNvcc
+              cudaCudart
+            ];
+
+            shellHook = ''
+              export CUDA_HOME="${cudaNvcc}"
+              export CUDA_PATH="${cudaNvcc}"
+              export CUDA_ROOT="${cudaNvcc}"
+              export CUDAToolkit_ROOT="${cudaNvcc}"
+
+              export CUDACXX="${cudaNvcc}/bin/nvcc"
+              export CMAKE_CUDA_COMPILER="${cudaNvcc}/bin/nvcc"
+
+              # Default toolchain: latest GCC.
+              export CC="${pkgs.gcc}/bin/gcc"
+              export CXX="${pkgs.gcc}/bin/g++"
+
+              # NVCC host compiler: GCC 14 (supported by CUDA 12.8).
+              export NVCC_CCBIN="${pkgs.gcc14}/bin/g++"
+              export CUDAHOSTCXX="${pkgs.gcc14}/bin/g++"
+              export CUDAHOSTCOMPILER="${pkgs.gcc14}/bin/g++"
+              export CMAKE_CUDA_HOST_COMPILER="${pkgs.gcc14}/bin/g++"
+
+              # Make headers/libs discoverable for non-CMake builds too.
+              export CPATH="${cudaNvcc}/include:${cudaCudart}/include:$CPATH"
+	              export LIBRARY_PATH="${cudaCudart}/lib:$LIBRARY_PATH"
+
+	              # Runtime: libcudart comes from Nix, but libcuda.so.1 comes from the NVIDIA driver.
+	              #
+	              # We avoid hardcoding NixOS-only driver library paths so the devshell also
+	              # works on non-NixOS systems (where libcuda is typically available via the
+	              # system loader cache / default library paths).
+	              export LD_LIBRARY_PATH="${cudaCudart}/lib:${pkgs.stdenv.cc.cc.lib.outPath}/lib:$LD_LIBRARY_PATH"
+
+	              __cuda_append_ld_library_path() {
+	                local dir="$1"
+	                if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+	                  return 1
+	                fi
+	                case ":$LD_LIBRARY_PATH:" in
+	                  *":$dir:"*) return 0 ;;
+	                  *) export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH" ;;
+	                esac
+	              }
+
+	              __cuda_has_libcuda() {
+	                if command -v ldconfig >/dev/null 2>&1; then
+	                  if ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1'; then
+	                    return 0
+	                  fi
+	                fi
+
+		                for __d in $(echo "$LD_LIBRARY_PATH" | tr ':' ' '); do
+		                  if [ -n "$__d" ] && [ -e "$__d/libcuda.so.1" ]; then
+		                    return 0
+		                  fi
+		                done
+
+	                for __d in /usr/lib/wsl/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib; do
+	                  if [ -e "$__d/libcuda.so.1" ]; then
+	                    return 0
+	                  fi
+	                done
+
+	                return 1
+	              }
+
+	              if ! __cuda_has_libcuda; then
+	                # NixOS: infer the driver lib directory from nvidia-smi's RUNPATH/RPATH.
+	                # This points at the active nvidia-x11 store lib path (contains libcuda.so.1).
+	                if command -v nvidia-smi >/dev/null 2>&1; then
+	                  __nvidia_smi="$(command -v nvidia-smi)"
+
+	                  __runpath="$(
+	                    readelf -d "$__nvidia_smi" 2>/dev/null \
+	                      | sed -n 's/.*(RUNPATH).*\[\(.*\)\].*/\1/p' \
+	                      | head -n 1
+	                  )"
+	                  if [ -z "$__runpath" ]; then
+	                    __runpath="$(
+	                      readelf -d "$__nvidia_smi" 2>/dev/null \
+	                        | sed -n 's/.*(RPATH).*\[\(.*\)\].*/\1/p' \
+	                        | head -n 1
+	                    )"
+	                  fi
+
+	                  if [ -n "$__runpath" ]; then
+	                    for __dir in $(echo "$__runpath" | tr ':' ' '); do
+	                      if [ -n "$__dir" ] && [ -e "$__dir/libcuda.so.1" ]; then
+	                        __cuda_append_ld_library_path "$__dir" || true
+	                        break
+	                      fi
+	                    done
+	                  fi
+	                fi
+	              fi
+
+	              if ! __cuda_has_libcuda; then
+	                echo "warning: libcuda.so.1 not found; CUDA programs may fail at runtime." 1>&2
+	              fi
+	            '';
+	          };
+
+          # Full / experimental environment (slow; includes ML + graphics deps).
+          full =
+            let
+              cudart = pkgs.cudaPackages.cuda_cudart;
+              cudartStatic = cudart.static or null;
+              cudartStaticLibPath = pkgs.lib.optionalString (cudartStatic != null) ":${cudartStatic}/lib";
+              cudartStaticLibFlag = pkgs.lib.optionalString (cudartStatic != null) " -L${cudartStatic}/lib";
+            in
+            pkgs.mkShell {
             # Use minimal stdenv to avoid interference
             stdenv = pkgs.stdenv;
             python = pkgs.python3;
             # The Nix packages provided in the environment
-            packages = with pkgs; [
+            packages =
+              with pkgs;
+              [
               boost # The Boost libraries
               ccache
               # stdenv.cc
@@ -65,8 +196,7 @@
               ninja
               ffmpeg
               fmt.dev
-              cudaPackages.cuda_cudart
-              cudaPackages.cuda_cudart.static
+              cudart
               cudaPackages.cudnn
               cudatoolkit
               # nvidia package should be consistent with the system nvidia driver
@@ -123,16 +253,17 @@
               cmake # Ensure latest CMake for LLVM
               which # For Python executable detection
               linuxHeaders # Linux kernel headers for system includes
-            ];
+              ]
+              ++ pkgs.lib.optional (cudartStatic != null) cudartStatic;
 
             shellHook = ''
               # export GCC_PREFIX="${pkgs.stdenv.cc.cc}"
               # export UV_PYTHON_PREFERENCE="only-system";
               # export UV_PYTHON=${pkgs.python3}
-              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib.outPath}/lib:${pkgs.linuxPackages.nvidia_x11_vulkan_beta_open}/lib:${pkgs.zlib}/lib:${pkgs.cudatoolkit}/lib64:${pkgs.cudaPackages.cuda_cudart}/lib:${pkgs.cudaPackages.cuda_cudart.static}/lib:$LD_LIBRARY_PATH"
+              export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib.outPath}/lib:${pkgs.linuxPackages.nvidia_x11_vulkan_beta_open}/lib:${pkgs.zlib}/lib:${pkgs.cudatoolkit}/lib64:${cudart}/lib${cudartStaticLibPath}:$LD_LIBRARY_PATH"
               export CUDA_PATH=${pkgs.cudatoolkit}
               export CUDA_ROOT=${pkgs.cudatoolkit}
-              export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11_vulkan_beta_open}/lib -L${pkgs.cudatoolkit}/lib64 -L${pkgs.cudaPackages.cuda_cudart}/lib -L${pkgs.cudaPackages.cuda_cudart.static}/lib"
+              export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11_vulkan_beta_open}/lib -L${pkgs.cudatoolkit}/lib64 -L${cudart}/lib${cudartStaticLibFlag}"
               export EXTRA_CCFLAGS="-isystem ${pkgs.glibc_multi.dev}/include"
               export CMAKE_PREFIX_PATH="${pkgs.glfw}:${pkgs.fmt.dev}:${pkgs.cudatoolkit}:${pkgs.cudaPackages.cuda_cudart}:$CMAKE_PREFIX_PATH"
               export PKG_CONFIG_PATH="${pkgs.glfw}/lib/pkgconfig:${pkgs.fmt.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
@@ -148,13 +279,13 @@
               unset CPLUS_INCLUDE_PATH
               unset C_INCLUDE_PATH  
               unset CPATH
-              unset NIX_CFLAGS_COMPILE
-              unset NIX_LDFLAGS_BEFORE
-              # Add CUDA headers and system headers for the raw GCC compiler
-              export CPLUS_INCLUDE_PATH="${pkgs.cudaPackages.cuda_cudart.dev}/include:${pkgs.cudatoolkit}/include:${pkgs.glibc_multi.dev}/include:${pkgs.linuxHeaders}/include"
-              export C_INCLUDE_PATH="${pkgs.cudaPackages.cuda_cudart.dev}/include:${pkgs.cudatoolkit}/include:${pkgs.glibc_multi.dev}/include:${pkgs.linuxHeaders}/include"
-              export NIX_LDFLAGS="-L${pkgs.glibc_multi.out}/lib -L${pkgs.gcc.cc.lib}/lib -L${pkgs.cudatoolkit}/lib64 -L${pkgs.cudaPackages.cuda_cudart}/lib -L${pkgs.cudaPackages.cuda_cudart.static}/lib $NIX_LDFLAGS"
-              export LIBRARY_PATH="${pkgs.gcc.cc.lib}/lib:${pkgs.glibc_multi.out}/lib:${pkgs.cudatoolkit}/lib64:${pkgs.cudaPackages.cuda_cudart}/lib:${pkgs.cudaPackages.cuda_cudart.static}/lib:$LIBRARY_PATH"
+	              unset NIX_CFLAGS_COMPILE
+	              unset NIX_LDFLAGS_BEFORE
+	              # Add CUDA headers and system headers for the raw GCC compiler
+	              export CPLUS_INCLUDE_PATH="${pkgs.cudatoolkit}/include:${pkgs.glibc_multi.dev}/include:${pkgs.linuxHeaders}/include"
+	              export C_INCLUDE_PATH="${pkgs.cudatoolkit}/include:${pkgs.glibc_multi.dev}/include:${pkgs.linuxHeaders}/include"
+              export NIX_LDFLAGS="-L${pkgs.glibc_multi.out}/lib -L${pkgs.gcc.cc.lib}/lib -L${pkgs.cudatoolkit}/lib64 -L${cudart}/lib${cudartStaticLibFlag} $NIX_LDFLAGS"
+              export LIBRARY_PATH="${pkgs.gcc.cc.lib}/lib:${pkgs.glibc_multi.out}/lib:${pkgs.cudatoolkit}/lib64:${cudart}/lib${cudartStaticLibPath}:$LIBRARY_PATH"
               # CUDA compiler settings - use raw GCC for NVCC host compiler
               export NVCC_CCBIN="${pkgs.gcc.cc}/bin/g++"
               export CUDAHOSTCXX="${pkgs.gcc.cc}/bin/g++"
